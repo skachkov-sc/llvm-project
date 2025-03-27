@@ -553,6 +553,7 @@ public:
     case VPRecipeBase::VPWidenIntOrFpInductionSC:
     case VPRecipeBase::VPWidenPointerInductionSC:
     case VPRecipeBase::VPReductionPHISC:
+    case VPRecipeBase::VPMonotonicPHISC:
     case VPRecipeBase::VPPartialReductionSC:
       return true;
     case VPRecipeBase::VPBranchOnMaskSC:
@@ -1014,6 +1015,7 @@ public:
     ComputeAnyOfResult,
     ComputeFindIVResult,
     ComputeReductionResult,
+    ComputeMonotonicResult,
     // Extracts the last lane from its operand if it is a vector, or the last
     // part if scalar. In the latter case, the recipe will be removed during
     // unrolling.
@@ -2406,6 +2408,50 @@ public:
   }
 };
 
+/// A recipe for handling monotonic phis. The start value is the first operand
+/// of the recipe and the incoming value from the backedge is the second
+/// operand.
+class VPMonotonicPHIRecipe : public VPHeaderPHIRecipe {
+  MonotonicDescriptor Desc;
+
+public:
+  VPMonotonicPHIRecipe(PHINode *Phi, const MonotonicDescriptor &Desc,
+                       VPValue *Start)
+      : VPHeaderPHIRecipe(VPDef::VPMonotonicPHISC, Phi, Start), Desc(Desc) {}
+
+  ~VPMonotonicPHIRecipe() override = default;
+
+  VPMonotonicPHIRecipe *clone() override {
+    auto *R = new VPMonotonicPHIRecipe(cast<PHINode>(getUnderlyingInstr()),
+                                       Desc, getStartValue());
+    R->addOperand(getBackedgeValue());
+    return R;
+  }
+
+  VP_CLASSOF_IMPL(VPDef::VPMonotonicPHISC)
+
+  static inline bool classof(const VPHeaderPHIRecipe *R) {
+    return R->getVPDefID() == VPDef::VPMonotonicPHISC;
+  }
+
+  void execute(VPTransformState &State) override;
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  /// Print the recipe.
+  void print(raw_ostream &O, const Twine &Indent,
+             VPSlotTracker &SlotTracker) const override;
+#endif
+
+  const MonotonicDescriptor &getDescriptor() const { return Desc; }
+
+  /// Returns true if the recipe only uses the first lane of operand \p Op.
+  bool usesFirstLaneOnly(const VPValue *Op) const override {
+    assert(is_contained(operands(), Op) &&
+           "Op must be an operand of the recipe");
+    return true;
+  }
+};
+
 /// A recipe for vectorizing a phi-node as a sequence of mask-based select
 /// instructions.
 class LLVM_ABI_FOR_TEST VPBlendRecipe : public VPSingleDefRecipe {
@@ -3193,6 +3239,9 @@ protected:
   /// Whether the consecutive accessed addresses are in reverse order.
   bool Reverse;
 
+  /// Whether the consecutive accessed addresses are compressed with mask value.
+  bool Compressed;
+
   /// Whether the memory access is masked.
   bool IsMasked = false;
 
@@ -3206,12 +3255,13 @@ protected:
 
   VPWidenMemoryRecipe(const char unsigned SC, Instruction &I,
                       std::initializer_list<VPValue *> Operands,
-                      bool Consecutive, bool Reverse,
+                      bool Consecutive, bool Reverse, bool Compressed,
                       const VPIRMetadata &Metadata, DebugLoc DL)
       : VPRecipeBase(SC, Operands, DL), VPIRMetadata(Metadata), Ingredient(I),
         Alignment(getLoadStoreAlignment(&I)), Consecutive(Consecutive),
-        Reverse(Reverse) {
+        Reverse(Reverse), Compressed(Compressed) {
     assert((Consecutive || !Reverse) && "Reverse implies consecutive");
+    assert((Consecutive || !Compressed) && "Compressed implies consecutive");
     assert(isa<VPVectorEndPointerRecipe>(getAddr()) ||
            !Reverse &&
                "Reversed acccess without VPVectorEndPointerRecipe address?");
@@ -3240,6 +3290,9 @@ public:
   /// Return whether the consecutive loaded/stored addresses are in reverse
   /// order.
   bool isReverse() const { return Reverse; }
+
+  /// Return whether the consecutive loaded/stored addresses are compressed.
+  bool isCompressed() const { return Compressed; }
 
   /// Return the address accessed by this recipe.
   VPValue *getAddr() const { return getOperand(0); }
@@ -3274,18 +3327,18 @@ public:
 struct LLVM_ABI_FOR_TEST VPWidenLoadRecipe final : public VPWidenMemoryRecipe,
                                                    public VPValue {
   VPWidenLoadRecipe(LoadInst &Load, VPValue *Addr, VPValue *Mask,
-                    bool Consecutive, bool Reverse,
+                    bool Consecutive, bool Reverse, bool Compressed,
                     const VPIRMetadata &Metadata, DebugLoc DL)
       : VPWidenMemoryRecipe(VPDef::VPWidenLoadSC, Load, {Addr}, Consecutive,
-                            Reverse, Metadata, DL),
+                            Reverse, Compressed, Metadata, DL),
         VPValue(this, &Load) {
     setMask(Mask);
   }
 
   VPWidenLoadRecipe *clone() override {
     return new VPWidenLoadRecipe(cast<LoadInst>(Ingredient), getAddr(),
-                                 getMask(), Consecutive, Reverse, *this,
-                                 getDebugLoc());
+                                 getMask(), Consecutive, Reverse, Compressed,
+                                 *this, getDebugLoc());
   }
 
   VP_CLASSOF_IMPL(VPDef::VPWidenLoadSC);
@@ -3316,8 +3369,8 @@ struct VPWidenLoadEVLRecipe final : public VPWidenMemoryRecipe, public VPValue {
   VPWidenLoadEVLRecipe(VPWidenLoadRecipe &L, VPValue *Addr, VPValue &EVL,
                        VPValue *Mask)
       : VPWidenMemoryRecipe(VPDef::VPWidenLoadEVLSC, L.getIngredient(),
-                            {Addr, &EVL}, L.isConsecutive(), L.isReverse(), L,
-                            L.getDebugLoc()),
+                            {Addr, &EVL}, L.isConsecutive(), L.isReverse(),
+                            L.isCompressed(), L, L.getDebugLoc()),
         VPValue(this, &getIngredient()) {
     setMask(Mask);
   }
@@ -3355,16 +3408,16 @@ struct VPWidenLoadEVLRecipe final : public VPWidenMemoryRecipe, public VPValue {
 struct LLVM_ABI_FOR_TEST VPWidenStoreRecipe final : public VPWidenMemoryRecipe {
   VPWidenStoreRecipe(StoreInst &Store, VPValue *Addr, VPValue *StoredVal,
                      VPValue *Mask, bool Consecutive, bool Reverse,
-                     const VPIRMetadata &Metadata, DebugLoc DL)
+                     bool Compressed, const VPIRMetadata &Metadata, DebugLoc DL)
       : VPWidenMemoryRecipe(VPDef::VPWidenStoreSC, Store, {Addr, StoredVal},
-                            Consecutive, Reverse, Metadata, DL) {
+                            Consecutive, Reverse, Compressed, Metadata, DL) {
     setMask(Mask);
   }
 
   VPWidenStoreRecipe *clone() override {
     return new VPWidenStoreRecipe(cast<StoreInst>(Ingredient), getAddr(),
                                   getStoredValue(), getMask(), Consecutive,
-                                  Reverse, *this, getDebugLoc());
+                                  Reverse, Compressed, *this, getDebugLoc());
   }
 
   VP_CLASSOF_IMPL(VPDef::VPWidenStoreSC);
@@ -3399,7 +3452,8 @@ struct VPWidenStoreEVLRecipe final : public VPWidenMemoryRecipe {
                         VPValue *Mask)
       : VPWidenMemoryRecipe(VPDef::VPWidenStoreEVLSC, S.getIngredient(),
                             {Addr, S.getStoredValue(), &EVL}, S.isConsecutive(),
-                            S.isReverse(), S, S.getDebugLoc()) {
+                            S.isReverse(), S.isCompressed(), S,
+                            S.getDebugLoc()) {
     setMask(Mask);
   }
 
